@@ -93,7 +93,7 @@ so where they were.
 | **All-reduce flag lines:** 64-byte lines instead of 128 (GCN3 cache line) | flag write 11 us per round; tg 48.2 | 7.5 us; tg 49.1 |
 | **All-reduce for prompts:** q8 data on the wire, staged in VRAM | pp512 365 | pp512 400 |
 | **MoE prompt matmul:** GCN medium `mmqid` warptile 256 x 64 x 64 | pp512 401 | pp512 413 |
-| **Chip power limit** raised from 81 W to 100-110 W through a runtime PowerPlay table (no VBIOS flash); prompt processing was power-capped at ~849 MHz, decode never was | pp512 / pp512 @ 16K at 81 W | +12% / +22% at 100 W |
+| **Chip power limit** raised from 81 W to 100-110 W through a runtime PowerPlay table, no VBIOS flash ([firepro-power](https://github.com/pcbjunkie/firepro-power)); prompt processing was power-capped at ~849 MHz, decode never was | pp512 / pp512 @ 16K at 81 W | +12% / +22% at 100 W |
 
 Things that were tried and measured slower stay off by default: router matvec + top-k in one kernel
 (`LOCAL_VK_ROUTER_TOPK=1`), Q staged in shared memory for decode attention, early V loads, other prefill tile
@@ -115,9 +115,9 @@ Notes:
 
 - Tested on Debian 12, kernel 6.1, Mesa 22.3.6 (RADV), amdgpu driver. Other GCN3/GCN4 cards should work but are
   untested.
-- The prompt numbers above are at a 110 W chip limit with clocks pinned high
-  (`power_dpm_force_performance_level=high`). At the stock 81 W limit, prompt processing is roughly 10-20%
-  slower. Token generation is unaffected.
+- The prompt numbers above are at a 110 W chip limit with clocks pinned high, set with
+  [firepro-power](https://github.com/pcbjunkie/firepro-power) (runtime PowerPlay table, no VBIOS flash). At
+  the stock 81 W limit, prompt processing is roughly 10-20% slower. Token generation is unaffected.
 - Every new kernel has an off switch (`LOCAL_VK_FA_PREFILL=0`, `LOCAL_VK_FA4=0`, `LOCAL_VK_FA4_H1=0`,
   `LOCAL_VK_NO_MMID_SUM=1`, `LOCAL_VK_COMM_Q8=0`) for comparison or troubleshooting.
 - `GGML_VK_PERF_LOGGER=1` prints per-op GPU timings. In `llama-bench` only the measured runs are logged.
