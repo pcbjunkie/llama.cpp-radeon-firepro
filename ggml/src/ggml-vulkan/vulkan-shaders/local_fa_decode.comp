@@ -1,0 +1,254 @@
+#version 450
+
+// local: single-token flash attention for GQA, head size 128, f16 K/V, one subgroup of 64 per workgroup.
+// Workgroup (x = split, y = kv head, z = group of HG query heads) walks cpw chunks of 64 keys with an
+// online softmax: lane t owns key t of the chunk and computes its scores for the group's heads
+// (Q in shared memory), then lane t accumulates output dims 2t, 2t+1 over the chunk's keys.
+// One wave doing all 8 heads of a chunk is ~22K cycles of issue on a single SIMD, so the heads are
+// spread over workgroups to occupy more of the GPU.
+// With more than one split, partials (O, max, sum) go to a scratch buffer and the last workgroup of a
+// (kv head, head group) combines them (atomic counter), so the op stays one dispatch.
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout (push_constant) uniform parameter {
+    uint KV;
+    uint G;        // query heads per kv head (<= 8)
+    uint nsplit;
+    uint cpw;      // 64-key chunks per workgroup
+    uint q_s2;     // floats between query heads
+    uint k_s1;     // f16 elements between keys
+    uint k_s2;     // f16 elements between kv heads
+    uint v_s1;
+    uint v_s2;
+    uint has_mask;
+    uint d_s1;     // floats between output heads
+    float scale;
+} p;
+
+layout (binding = 0) readonly buffer Q { float q[]; };
+layout (binding = 1) readonly buffer K { uvec4 k4[]; };
+layout (binding = 2) readonly buffer V { uint v1[]; };
+layout (binding = 3) readonly buffer M { uint m1[]; };
+layout (binding = 4) writeonly buffer D { float d[]; };
+layout (binding = 5) coherent buffer S { float part[]; };
+layout (binding = 5) coherent buffer SC { uint cnt[]; };
+// plain view for the combine: this workgroup never read these addresses during the dispatch, so its
+// loads miss L1 and come from L2, where the other workgroups' coherent stores landed
+layout (binding = 5) readonly buffer SR { float partr[]; };
+
+#define HS 128
+#define HG 2                // query heads per workgroup
+#define PART_BASE 64        // floats reserved for counters (kv head * 8 + head group)
+#define PART_STRIDE (HS + 2)
+
+shared vec4 qs[HG][HS / 4];
+shared vec2 ps[64];         // probabilities of key j (chunk loop)
+#define MAX_SPLIT 256
+shared vec2 ws[MAX_SPLIT + 8];  // split weights (combine), zero past nsplit
+shared uint sh_last;
+
+const float NEG_INF = -1.0 / 0.0;
+
+uint part_base(const uint hk, const uint z, const uint sp, const uint h) {
+    return PART_BASE + (((hk * 8 + z) * p.nsplit + sp) * HG + h) * PART_STRIDE;
+}
+
+void main() {
+    const uint t  = gl_LocalInvocationID.x;
+    const uint wg = gl_WorkGroupID.x;
+    const uint hk = gl_WorkGroupID.y;
+    const uint z  = gl_WorkGroupID.z;
+    const uint G  = p.G;
+    const uint h0 = z * HG;                 // first query head (within the kv head) of this group
+    const uint ng = min(HG, G - h0);        // heads in this group
+
+    for (uint idx = t; idx < ng * (HS / 4); idx += 64) {
+        const uint h  = idx / (HS / 4);
+        const uint d4 = idx % (HS / 4);
+        const uint qb = (hk * G + h0 + h) * p.q_s2 + d4 * 4;
+        qs[h][d4] = vec4(q[qb], q[qb + 1], q[qb + 2], q[qb + 3]) * p.scale;
+    }
+    barrier();
+
+    float Mh[HG];
+    float Lh[HG];
+    vec2  Oh[HG];
+    [[unroll]] for (uint h = 0; h < HG; h++) {
+        Mh[h] = NEG_INF;
+        Lh[h] = 0.0;
+        Oh[h] = vec2(0.0);
+    }
+
+    const uint kv0 = wg * p.cpw * 64;
+    for (uint c = 0; c < p.cpw; c++) {
+        const uint kb = kv0 + c * 64;
+        if (kb >= p.KV) {
+            break;
+        }
+        const uint key = kb + t;
+        float s[HG];
+        [[unroll]] for (uint h = 0; h < HG; h++) {
+            s[h] = 0.0;
+        }
+        if (key < p.KV) {
+            const uint kbase = (key * p.k_s1 + hk * p.k_s2) / 8;
+            [[unroll]] for (uint d8 = 0; d8 < HS / 8; d8++) {
+                const uvec4 kk = k4[kbase + d8];
+                const vec4 ka = vec4(unpackHalf2x16(kk.x), unpackHalf2x16(kk.y));
+                const vec4 kc = vec4(unpackHalf2x16(kk.z), unpackHalf2x16(kk.w));
+                [[unroll]] for (uint h = 0; h < HG; h++) {
+                    s[h] += dot(qs[h][2 * d8], ka) + dot(qs[h][2 * d8 + 1], kc);
+                }
+            }
+            if ((p.has_mask & 1) != 0) {
+                const vec2 mm = unpackHalf2x16(m1[key / 2]);
+                const float mv = (key & 1) != 0 ? mm.y : mm.x;
+                [[unroll]] for (uint h = 0; h < HG; h++) {
+                    s[h] += mv;
+                }
+            }
+        } else {
+            [[unroll]] for (uint h = 0; h < HG; h++) {
+                s[h] = NEG_INF;
+            }
+        }
+
+        float pe[HG];
+        [[unroll]] for (uint h = 0; h < HG; h++) {
+            const float mx = subgroupMax(s[h]);
+            const float mn = max(Mh[h], mx);
+            const float corr = Mh[h] == NEG_INF ? 0.0 : exp(Mh[h] - mn);
+            pe[h] = s[h] == NEG_INF ? 0.0 : exp(s[h] - mn);
+            Lh[h] = Lh[h] * corr + subgroupAdd(pe[h]);
+            Oh[h] *= corr;
+            Mh[h] = mn;
+        }
+        ps[t] = vec2(pe[0], pe[1]);
+        barrier();
+
+        // all 64 keys, unrolled so the loads issue together; keys past KV have p = 0 (clamped index)
+        const uint vbase = hk * p.v_s2 / 2 + t;
+        [[unroll]] for (uint j0 = 0; j0 < 64; j0 += 16) {
+            vec2 vv[16];
+            [[unroll]] for (uint j = 0; j < 16; j++) {
+                const uint kj = min(kb + j0 + j, p.KV - 1);
+                vv[j] = unpackHalf2x16(v1[kj * p.v_s1 / 2 + vbase]);
+            }
+            [[unroll]] for (uint j = 0; j < 16; j++) {
+                const vec2 pj = ps[j0 + j];
+                Oh[0] += pj.x * vv[j];
+                Oh[1] += pj.y * vv[j];
+            }
+        }
+        barrier();
+    }
+
+    if (p.nsplit == 1) {
+        [[unroll]] for (uint h = 0; h < HG; h++) {
+            if (h < ng) {
+                const vec2 o = Oh[h] / Lh[h];
+                const uint db = (hk * G + h0 + h) * p.d_s1 + 2 * t;
+                d[db]     = o.x;
+                d[db + 1] = o.y;
+            }
+        }
+        return;
+    }
+
+    [[unroll]] for (uint h = 0; h < HG; h++) {
+        const uint pb = part_base(hk, z, wg, h);
+        part[pb + 2 * t]     = Oh[h].x;
+        part[pb + 2 * t + 1] = Oh[h].y;
+        if (t == 0) {
+            part[pb + HS]     = Mh[h];
+            part[pb + HS + 1] = Lh[h];
+        }
+    }
+    memoryBarrierBuffer();
+    barrier();
+    if (t == 0) {
+        const uint old = atomicAdd(cnt[hk * 8 + z], 1u);
+        sh_last = old == p.nsplit - 1 ? 1u : 0u;
+    }
+    barrier();
+    if (sh_last == 0) {
+        return;
+    }
+    memoryBarrierBuffer();
+
+    // 1) lane t holds splits t, t+64, ... (nsplit <= MAX_SPLIT): weights exp(m_s - M) / L. The loads are
+    //    clamped and unconditional so they issue together (the combine is a chain of L2 round trips)
+    {
+        float mr[HG][MAX_SPLIT / 64];
+        float lr[HG][MAX_SPLIT / 64];
+        [[unroll]] for (uint r = 0; r < MAX_SPLIT / 64; r++) {
+            const uint sp = min(t + 64 * r, p.nsplit - 1);
+            [[unroll]] for (uint h = 0; h < HG; h++) {
+                const uint pb = part_base(hk, z, sp, h);
+                mr[h][r] = partr[pb + HS];
+                lr[h][r] = partr[pb + HS + 1];
+            }
+        }
+        [[unroll]] for (uint h = 0; h < HG; h++) {
+            float ml = NEG_INF;
+            [[unroll]] for (uint r = 0; r < MAX_SPLIT / 64; r++) {
+                ml = max(ml, mr[h][r]);
+            }
+            const float mx = subgroupMax(ml);
+            float ll = 0.0;
+            [[unroll]] for (uint r = 0; r < MAX_SPLIT / 64; r++) {
+                const bool ok = t + 64 * r < p.nsplit && mr[h][r] != NEG_INF;
+                mr[h][r] = ok ? exp(mr[h][r] - mx) : 0.0;
+                ll += mr[h][r] * lr[h][r];
+            }
+            const float ls = subgroupAdd(ll);
+            [[unroll]] for (uint r = 0; r < MAX_SPLIT / 64; r++) {
+                const uint sp = t + 64 * r;
+                if (sp < p.nsplit) {
+                    ws[sp][h] = mr[h][r] / ls;
+                }
+            }
+        }
+    }
+    if (t < 8) {
+        ws[p.nsplit + t] = vec2(0.0);
+    }
+    barrier();
+    // 2) lane t sums dims 2t, 2t+1 over the splits, 8 splits of loads in flight at a time
+    vec2 Oc[HG];
+    [[unroll]] for (uint h = 0; h < HG; h++) {
+        Oc[h] = vec2(0.0);
+    }
+    for (uint sp0 = 0; sp0 < p.nsplit; sp0 += 8) {
+        vec2 ov[8][HG];
+        [[unroll]] for (uint u = 0; u < 8; u++) {
+            const uint sp = min(sp0 + u, p.nsplit - 1);
+            [[unroll]] for (uint h = 0; h < HG; h++) {
+                const uint pb = part_base(hk, z, sp, h) + 2 * t;
+                ov[u][h] = vec2(partr[pb], partr[pb + 1]);
+            }
+        }
+        // no bounds test (the weights past nsplit are zero): with one, the compiler sinks each split's
+        // loads into its branch and waits for them one split at a time
+        [[unroll]] for (uint u = 0; u < 8; u++) {
+            const vec2 w = ws[sp0 + u];
+            Oc[0] += w.x * ov[u][0];
+            Oc[1] += w.y * ov[u][1];
+        }
+    }
+    [[unroll]] for (uint h = 0; h < HG; h++) {
+        if (h < ng) {
+            const uint db = (hk * G + h0 + h) * p.d_s1 + 2 * t;
+            d[db]     = Oc[h].x;
+            d[db + 1] = Oc[h].y;
+        }
+    }
+    if (t == 0) {
+        cnt[hk * 8 + z] = 0u;
+    }
+}

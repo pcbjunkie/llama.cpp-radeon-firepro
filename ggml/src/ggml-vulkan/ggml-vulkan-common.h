@@ -1,3 +1,4 @@
+#include <atomic>
 #pragma once
 #include "ggml-vulkan-push-constants.h"
 
@@ -9,6 +10,10 @@ inline std::ostream & operator<<(std::ostream & os, vk::Buffer buffer) {
 extern ggml_backend_buffer_type_i ggml_backend_vk_buffer_type_interface;
 extern bool vk_memory_logger_enabled;
 extern bool vk_perf_logger_enabled;
+// local diagnostics: LOCAL_VK_COUNT_SYNC=1 counts dispatches and graph barriers, printed at exit
+extern std::atomic<uint64_t> local_vk_n_dispatch;
+extern std::atomic<uint64_t> local_vk_n_sync;
+extern bool local_vk_count_sync;
 extern bool vk_perf_logger_concurrent;
 extern bool vk_enable_sync_logger;
 extern uint32_t vk_perf_logger_frequency;
@@ -125,6 +130,9 @@ void ggml_vk_get_rows(ggml_backend_vk_context * ctx, vk_context& subctx, const g
 void ggml_vk_get_rows_back(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
 void ggml_vk_acc(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
 void ggml_vk_multi_add(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_cgraph * cgraph, int node_idx);
+void ggml_vk_local_flush_pending_reduce(ggml_backend_vk_context * ctx);
+void ggml_vk_multi_add_tensors(ggml_backend_vk_context * ctx, vk_context& subctx, vk_pipeline pipeline,
+                               const ggml_tensor * const * tensors, uint32_t num_srcs);
 void ggml_vk_add(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
 void ggml_vk_out_prod(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
 void ggml_vk_sub(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
@@ -251,6 +259,8 @@ ggml_backend_reg_t ggml_backend_vk_reg();
 void * ggml_backend_vk_comm_init(ggml_backend_t * backends, size_t n_backends);
 void ggml_backend_vk_comm_free(void * comm_ctx);
 bool ggml_backend_vk_comm_allreduce_tensor(void * comm_ctx, ggml_tensor ** tensors);
+uint64_t ggml_backend_vk_comm_begin(void * comm_ctx, size_t max_nbytes, size_t n_rounds);
+bool ggml_backend_vk_comm_allreduce_dev(void * comm_ctx, size_t i, ggml_tensor * t, uint64_t round);
 #endif
 
 // debug
@@ -287,6 +297,9 @@ bool ggml_vk_concat_supported(const ggml_tensor * src0, const ggml_tensor * src1
 
 template <typename T>
 inline void ggml_vk_dispatch_pipeline(ggml_backend_vk_context* ctx, vk_context& subctx, vk_pipeline& pipeline, std::initializer_list<vk::DescriptorBufferInfo> const& descriptor_buffer_infos, const T &push_constants, std::array<uint32_t, 3> elements) {
+    if (local_vk_count_sync) {
+        local_vk_n_dispatch.fetch_add(1, std::memory_order_relaxed);
+    }
     const uint32_t wg0 = CEIL_DIV(elements[0], pipeline->wg_denoms[0]);
     const uint32_t wg1 = CEIL_DIV(elements[1], pipeline->wg_denoms[1]);
     const uint32_t wg2 = CEIL_DIV(elements[2], pipeline->wg_denoms[2]);

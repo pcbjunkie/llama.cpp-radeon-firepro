@@ -710,6 +710,14 @@ struct vk_device_struct {
     std::recursive_mutex mutex;
     std::mutex queue_submit_mutex;
 
+    // local: small synchronous buffer writes are posted (vkCmdUpdateBuffer on the compute queue, no wait)
+    static constexpr int local_posted_ring = 32;
+    vk::CommandPool   local_posted_pool;
+    vk::CommandBuffer local_posted_cmd[local_posted_ring];
+    vk::Fence         local_posted_fence[local_posted_ring];
+    bool              local_posted_busy[local_posted_ring] = {};
+    int               local_posted_next = 0;
+
     // Guards compile_pending, all_pipelines, and the dynamic pipeline maps
     // (flash_attn, fa_mask_opt, solve_tri, conv2d, etc). The actual compile
     // runs with no lock held, so different pipelines can compile in parallel.
@@ -861,6 +869,18 @@ struct vk_device_struct {
     vk_pipeline pipeline_dequant_mul_mat_vec_f32_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_f16_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_id_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
+    vk_pipeline local_dmmv_id_rows[GGML_TYPE_COUNT];
+    vk_pipeline local_dmmv_id_kshort[GGML_TYPE_COUNT];
+    vk_pipeline local_dmmv_id_kshort_sum[GGML_TYPE_COUNT]; // local: same shader, expert-sum fusion (few rows per workgroup)
+    vk_pipeline local_pipeline_fa_decode; // local: single-token GQA attention
+    vk_pipeline local_pipeline_fa_decode4; // local: head groups of a kv head in one workgroup, K staged in shared memory
+    vk_pipeline local_pipeline_fa_decode4_h1; // local: same, 8 waves of one query head
+    vk_pipeline local_pipeline_fa_prefill; // local: multi-token GQA attention, all query heads of a kv head per workgroup
+    vk_pipeline local_pipeline_router_topk; // local: MoE router matvec + softmax/top-k/norm, one token
+    vk_pipeline local_pipeline_fa_decode8; // local: same, all heads of a kv head per workgroup (long KV)
+    vk_pipeline local_pipeline_fold_norm; // local: all-reduce fold + rms norm // local: 8-lane-per-row kernel for short rows // local: more rows per workgroup for small k (k <= 512)
+    vk_pipeline pipeline_dmmv_id_q4_k_glu; // local: gate+up+swiglu, null when unsupported
+    vk_pipeline pipeline_comm_wait;        // local: spin on peer flags in host memory
 
     vk_pipeline pipeline_dequant_mul_mat_vec_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_id_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
@@ -1160,6 +1180,7 @@ typedef std::vector<vk_submission> vk_sequence;
 #define MAT_VEC_FUSION_FLAGS_SCALE0 0x4
 
 #define MAT_VEC_FUSION_FLAGS_SCALE1 0x8
+#define MAT_VEC_FUSION_FLAGS_SUM_EXPERTS 0x10 // local: kshort sums the weighted experts into one output row
 
 struct vk_staging_memcpy {
     vk_staging_memcpy(void * _dst, const void * _src, size_t _n) : dst(_dst), src(_src), n(_n) {}
@@ -1367,6 +1388,10 @@ struct ggml_backend_vk_context {
     // QSA indexer gather+add+top_k fused into one radix-select
     bool fused_topk_qsa {};
     bool fused_hc_post_gate {};
+    bool local_fused_mmid_glu {};
+    bool local_fused_mmid_sum {}; // local: MUL_MAT_ID + MUL + views + ADD chain in one kshort dispatch
+    bool local_fused_router_topk {}; // local: router MUL_MAT + TOPK_MOE_EARLY_SOFTMAX_NORM in one dispatch
+    bool local_fold_norm {};               // pending all-reduce + residual ADD + RMS_NORM + MUL in one dispatch
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
 
     // for GGML_VK_PERF_LOGGER
@@ -1378,6 +1403,24 @@ struct ggml_backend_vk_context {
     std::vector<int> query_node_idx;
     int32_t num_queries {};
     int32_t query_idx {};
+
+    // local: deferred all-reduce sum, folded into the next graph's residual ADD when possible.
+    // srcs are held by value because the comm slot tensors are reused for every device.
+    const ggml_tensor * local_tail {};      // last node of the previous graph_compute
+    int32_t local_tail_uses {};
+    bool local_pending_active {};
+    bool local_pending_hold {};             // graph_compute is about to consume it
+    uint32_t local_pending_n {};            // number of summands, own partial first
+    ggml_tensor * local_pending_own {};
+    ggml_tensor local_pending_slots[MAX_PARAMETER_COUNT] {};
+    const ggml_tensor * local_pending_fold_node {};
+    bool local_pending_wait {};             // spin wait for the peers not emitted yet: fold_norm does it, others emit comm_wait first
+    vk_subbuffer local_pending_wait_buf[9] {}; // comm_wait bindings: peer flag pages, [7] own debug page, [8] sweep scratch
+    uint32_t local_pending_wait_pc[6] {};   // comm_wait push constants: round, np, limit, stride, lines, sweep
+    vk_buffer local_fa_scratch;             // local: fa_decode partials and counters
+    vk_buffer local_router_scratch;         // local: router_topk counter and logits
+    uint32_t local_fold_last_round {};     // local: last wait round fold_norm released, see the scratch reset
+    vk_buffer local_fold_scratch;           // local: fold_norm counter and partial sums
 };
 
 struct ggml_backend_vk_buffer_context {

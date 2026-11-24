@@ -1,0 +1,119 @@
+#version 450
+
+// local: MoE router for one token in one dispatch: logits = W x (f32), then softmax, top-k, and the
+// normalization of the selected probabilities (clamped sum), i.e. MUL_MAT + the TOPK_MOE_EARLY_SOFTMAX_NORM
+// subgraph. Each wave of a workgroup computes one logit (64 lanes over the row, subgroup add); workgroups
+// store their logits in a scratch buffer and bump a counter, and the last one to arrive selects the experts.
+// Ties go to the lower expert index.
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (push_constant) uniform parameter {
+    uint ncols;      // inputs per row (multiple of 4)
+    uint nexp;       // experts (rows), <= 128
+    uint k;          // experts used, <= 16
+    uint w_stride;   // floats between rows of W
+    float clamp_min;
+    float clamp_max;
+} p;
+
+layout (binding = 0) readonly buffer W { vec4 w4[]; };
+layout (binding = 1) readonly buffer X { vec4 x4[]; };
+layout (binding = 2) coherent volatile buffer S { uint cnt; uint pad[63]; float logit[]; };
+layout (binding = 3) writeonly buffer I { int ids[]; };
+layout (binding = 4) writeonly buffer O { float weights[]; };
+
+shared uint sh_last;
+
+const float NEG_INF = -1.0 / 0.0;
+
+void main() {
+    const uint w = gl_SubgroupID;
+    const uint t = gl_SubgroupInvocationID;
+    const uint row = gl_WorkGroupID.x * 4 + w;
+
+    if (row < p.nexp) {
+        // up to 8 chunks of 64 vec4 per row (ncols <= 2048) loaded together, the rest in a loop
+        float acc = 0.0;
+        const uint n4 = p.ncols / 4;
+        const uint wb = row * (p.w_stride / 4);
+        vec4 wv[8];
+        vec4 xv[8];
+        [[unroll]] for (uint j = 0; j < 8; j++) {
+            const uint i = min(t + 64 * j, n4 - 1);
+            wv[j] = w4[wb + i];
+            xv[j] = x4[i];
+        }
+        [[unroll]] for (uint j = 0; j < 8; j++) {
+            if (t + 64 * j < n4) {
+                acc += dot(wv[j], xv[j]);
+            }
+        }
+        for (uint i = t + 512; i < n4; i += 64) {
+            acc += dot(w4[wb + i], x4[i]);
+        }
+        acc = subgroupAdd(acc);
+        if (t == 0) {
+            logit[row] = acc;
+        }
+    }
+    memoryBarrierBuffer();
+    barrier();
+    if (gl_LocalInvocationID.x == 0) {
+        const uint old = atomicAdd(cnt, 1u);
+        sh_last = old == gl_NumWorkGroups.x - 1 ? 1u : 0u;
+    }
+    barrier();
+    if (sh_last == 0 || w != 0) {
+        return;
+    }
+    memoryBarrierBuffer();
+
+    // wave 0 of the last workgroup: lane t holds experts t and t + 64
+    const uint e0 = t;
+    const uint e1 = t + 64;
+    float l0 = e0 < p.nexp ? logit[e0] : NEG_INF;
+    float l1 = e1 < p.nexp ? logit[e1] : NEG_INF;
+    const float mx = subgroupMax(max(l0, l1));
+    const float x0 = e0 < p.nexp ? exp(l0 - mx) : 0.0;
+    const float x1 = e1 < p.nexp ? exp(l1 - mx) : 0.0;
+    const float inv = 1.0 / subgroupAdd(x0 + x1);
+    float p0 = x0 * inv;   // softmax probabilities
+    float p1 = x1 * inv;
+    if (e0 >= p.nexp) { p0 = NEG_INF; }
+    if (e1 >= p.nexp) { p1 = NEG_INF; }
+
+    float sel_p[16];
+    uint  sel_e[16];
+    float psum = 0.0;
+    [[unroll]] for (uint j = 0; j < 16; j++) {
+        if (j < p.k) {
+            // best of this lane (lower index on ties), then across the wave
+            const bool first = p0 >= p1;
+            const float pv = first ? p0 : p1;
+            const uint  ev = first ? e0 : e1;
+            const float best = subgroupMax(pv);
+            const uint  be = subgroupMin(pv == best ? ev : 0xFFFFFFFFu);
+            sel_p[j] = best;
+            sel_e[j] = be;
+            psum += best;
+            if (be == e0) { p0 = NEG_INF; }
+            if (be == e1) { p1 = NEG_INF; }
+        }
+    }
+    const float denom = clamp(psum, p.clamp_min, p.clamp_max);
+    [[unroll]] for (uint j = 0; j < 16; j++) {
+        if (j < p.k && t == j) {
+            ids[j] = int(sel_e[j]);
+            weights[j] = sel_p[j] / denom;
+        }
+    }
+    if (t == 0) {
+        cnt = 0u;
+    }
+}

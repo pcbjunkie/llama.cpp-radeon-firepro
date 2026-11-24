@@ -20,6 +20,13 @@
 #extension GL_KHR_shader_subgroup_shuffle : enable
 #extension GL_KHR_shader_subgroup_vote : enable
 
+#ifndef LOCAL_FA_CLUSTERED
+#define LOCAL_FA_CLUSTERED 1
+#endif
+#if LOCAL_FA_CLUSTERED
+#extension GL_KHR_shader_subgroup_clustered : require
+#endif
+
 #include "types.glsl"
 #include "dot_product_funcs.glsl"
 #include "flash_attn_base.glsl"
@@ -436,12 +443,34 @@ void main() {
 #endif // MMQ
 
         [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
-            // Compute sum across the D_split
-            [[unroll]] for (uint s = D_split / 2; s > 0; s >>= 1) {
+            // Compute sum across the D_split. Counted with a linear index: Mesa 22.3 does not unroll a loop
+            // whose counter shifts, which turns the xor masks into variables (ds_bpermute instead of DPP)
+            // and the Sf[r][c] accesses into selects.
+#if LOCAL_FA_CLUSTERED
+            // clustered add: DPP on GCN3, where each shuffle below is a ds_bpermute plus a wait
+            // (the cluster size must be a literal; D_split is a specialization constant, so these fold)
+            [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
+                if (D_split == 16) {
+                    Sf[r][c] = subgroupClusteredAdd(Sf[r][c], 16);
+                } else if (D_split == 8) {
+                    Sf[r][c] = subgroupClusteredAdd(Sf[r][c], 8);
+                } else if (D_split == 4) {
+                    Sf[r][c] = subgroupClusteredAdd(Sf[r][c], 4);
+                } else if (D_split == 2) {
+                    Sf[r][c] = subgroupClusteredAdd(Sf[r][c], 2);
+                }
+            }
+#else
+            [[unroll]] for (uint i = 1; i < 32; i++) {
+                const uint s = D_split >> i;
+                if (s == 0) {
+                    break;
+                }
                 [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
                     Sf[r][c] += subgroupShuffleXor(Sf[r][c], s);
                 }
             }
+#endif
         }
 
         if (LOGIT_SOFTCAP) {

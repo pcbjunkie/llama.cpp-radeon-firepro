@@ -1,0 +1,174 @@
+#version 450
+
+// local: finish a tensor-parallel all-reduce and the following RMS norm in one dispatch (one row, f32):
+//   x = residual + own partial + peer partials   -> l_out
+//   y = x * rsqrt(mean(x^2) + eps) * w             -> norm_out
+// nwg workgroups of 256 (one element per thread), all resident at once: the peer partials are read from
+// host memory, and one workgroup alone cannot keep enough of those reads in flight.
+// With np > 0 the kernel also does the spin wait of comm_wait.comp: workgroup 0 polls the peers' flag pages
+// and releases the others through a device-memory word. Peer data is only read after its flag was seen, and
+// the barrier before this dispatch invalidated L2 (GFX8), so no stale lines of it can be cached.
+// Each workgroup publishes its sum of squares and bumps a counter that only grows (target = next multiple
+// of nwg), waits for the others, then normalizes its own slice. Elements stay in registers, so l_out and
+// norm_out may alias the inputs.
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_realtime_clock : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (push_constant) uniform parameter {
+    uint n;
+    uint nsrc;     // summands in bindings 0..nsrc-1 (residual, own, peers), <= 5
+    float eps;
+    uint nwg;
+    uint round;    // wait: flag value to reach
+    uint np;       // wait: peers to wait for (their flags in bindings 2..), 0 = no wait
+    uint limit;    // wait: max realtime clock ticks
+    uint stride;   // wait: words between polled lines
+    uint lines;    // wait: distinct lines in a flag page
+    uint sweep;    // wait: vec4 elements in the scratch buffer
+    uint poff;     // word offset of the peer partials in bindings 2..4
+    uint foff;     // wait: word offset of this round's flag page in bindings 2..4
+} p;
+
+layout (binding = 0) readonly buffer S0 { float s0[]; };
+layout (binding = 1) readonly buffer S1 { float s1[]; };
+// peers' host buffers from offset 0: partials at poff, flag pages at foff
+layout (binding = 2) coherent volatile readonly buffer S2 { uint s2[]; };
+layout (binding = 3) coherent volatile readonly buffer S3 { uint s3[]; };
+layout (binding = 4) coherent volatile readonly buffer S4 { uint s4[]; };
+layout (binding = 5) writeonly buffer LO { float l_out[]; };
+layout (binding = 6) readonly buffer W { float w[]; };
+layout (binding = 7) writeonly buffer NO { float norm_out[]; };
+layout (binding = 8) coherent volatile buffer SC { uint cnt; uint go; uint pad0[62]; float part[]; };
+layout (binding = 9)  coherent volatile buffer F7 { uint f7[]; };
+layout (binding = 10) coherent buffer SW { uvec4 scratch[]; };
+
+shared float sh_sum[4];
+shared float sh_total;
+shared uint sh_done;
+
+uint load_flag(uint k, uint i) {
+    switch (k) {
+    case 0: return s2[p.foff + i];
+    case 1: return s3[p.foff + i];
+    default: return s4[p.foff + i];
+    }
+}
+
+// workgroup 0 only, same protocol as comm_wait.comp
+void wait_peers(uint tid) {
+    uint polls = 0;
+    uint sweeps = 0;
+    const uint t0 = clockRealtime2x32EXT().x;
+    const bool dead = f7[8] != 0;
+    // thread 0 reads line l of every peer per step, the loads in flight together (one peer after the other
+    // made each wait a chain of PCIe round trips); peers already seen stay seen
+    const uint all = (1u << p.np) - 1u;
+    uint got = 0;
+    while (!dead) {
+        if (tid == 0) {
+            uint done = 0;
+            for (uint l = 0; l < p.lines && got != all; l++) {
+                uint v[3];
+                [[unroll]] for (uint k = 0; k < 3; k++) {
+                    v[k] = load_flag(k, l * p.stride);   // bindings past np repeat a valid buffer
+                }
+                polls++;
+                [[unroll]] for (uint k = 0; k < 3; k++) {
+                    if (k < p.np && int(v[k] - p.round) >= 0) {
+                        got |= 1u << k;
+                    }
+                }
+            }
+            if (got == all) {
+                done = 1;
+            } else if (clockRealtime2x32EXT().x - t0 >= p.limit) {
+                f7[8] = f7[8] + 1;
+                f7[9] = clockRealtime2x32EXT().x - t0;
+                f7[10] = p.round;
+                f7[11] = findLSB(~got);
+                f7[12] = polls;
+                f7[13] = sweeps;
+                done = 2;
+            }
+            sh_done = done;
+        }
+        barrier();
+        const uint done = sh_done;
+        barrier();
+        if (done != 0) {
+            break;
+        }
+        uvec4 acc = uvec4(0);
+        for (uint i = tid; i < p.sweep; i += 256) {
+            acc ^= scratch[i];
+        }
+        if (acc.x == 0x9e3779b9u && acc.y == p.round) {
+            scratch[0].w = acc.z;
+        }
+        sweeps++;
+    }
+    if (tid == 0) {
+        f7[3] = f7[3] + 1;
+        f7[4] = f7[4] + polls;
+        f7[2] = f7[2] + sweeps;
+        f7[5] = f7[5] + (clockRealtime2x32EXT().x - t0);
+        f7[16] = p.round;
+        memoryBarrierBuffer();
+        atomicExchange(go, p.round);
+    }
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint wg  = gl_WorkGroupID.x;
+    const uint i   = wg * 256 + tid;
+
+    float x = 0.0;
+    if (i < p.n) {
+        x = s0[i] + s1[i];
+    }
+    if (p.np > 0) {
+        if (wg == 0) {
+            wait_peers(tid);
+        } else if (tid == 0) {
+            while (int(atomicAdd(go, 0u) - p.round) < 0) {
+            }
+        }
+        memoryBarrierBuffer();
+        barrier();
+    }
+    if (i < p.n) {
+        if (p.nsrc > 2) x += uintBitsToFloat(s2[p.poff + i]);
+        if (p.nsrc > 3) x += uintBitsToFloat(s3[p.poff + i]);
+        if (p.nsrc > 4) x += uintBitsToFloat(s4[p.poff + i]);
+        l_out[i] = x;
+    }
+    float sq = subgroupAdd(x * x);
+    if (gl_SubgroupInvocationID == 0) {
+        sh_sum[gl_SubgroupID] = sq;
+    }
+    barrier();
+    if (tid == 0) {
+        part[wg] = sh_sum[0] + sh_sum[1] + sh_sum[2] + sh_sum[3];
+        memoryBarrierBuffer();
+        const uint old = atomicAdd(cnt, 1u);
+        const uint target = (old / p.nwg + 1) * p.nwg;
+        while (int(atomicAdd(cnt, 0u) - target) < 0) {
+        }
+        memoryBarrierBuffer();
+        float total = 0.0;
+        for (uint k = 0; k < p.nwg; k++) {
+            total += part[k];
+        }
+        sh_total = total;
+    }
+    barrier();
+    if (i < p.n) {
+        norm_out[i] = x * inversesqrt(sh_total / float(p.n) + p.eps) * w[i];
+    }
+}

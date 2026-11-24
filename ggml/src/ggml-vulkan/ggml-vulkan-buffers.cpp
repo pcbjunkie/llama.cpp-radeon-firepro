@@ -410,7 +410,20 @@ static vk_context ggml_vk_begin_sync_ctx(vk_device & device, vk_command_pool & p
     return subctx;
 }
 
+// local: wait for posted writes, before work on another queue may touch the same memory
+static void ggml_vk_local_posted_drain(vk_device & device) {
+    std::lock_guard<std::recursive_mutex> guard(device->mutex);
+    for (int i = 0; i < vk_device_struct::local_posted_ring; i++) {
+        if (device->local_posted_busy[i]) {
+            VK_CHECK(device->device.waitForFences({ device->local_posted_fence[i] }, true, UINT64_MAX), "posted write drain", device);
+            device->device.resetFences({ device->local_posted_fence[i] });
+            device->local_posted_busy[i] = false;
+        }
+    }
+}
+
 static void ggml_vk_submit_sync(vk_device & device, vk_context & subctx) {
+    ggml_vk_local_posted_drain(device);
     ggml_vk_ctx_end(subctx);
 
     for (auto & cpy : subctx->in_memcpys) {
@@ -601,6 +614,51 @@ bool ggml_vk_buffer_write_async(vk_context subctx, vk_buffer& dst, size_t offset
     return ggml_vk_buffer_write_2d_async(subctx, dst, offset, src, size, size, size, 1, sync_staging);
 }
 
+// local: post a small write to the compute queue without waiting for it. The data goes into the command
+// buffer (vkCmdUpdateBuffer), so src may be reused at once; the barrier's second scope covers everything
+// submitted later to the same queue, which is where the graphs that read it run.
+static bool ggml_vk_local_buffer_write_posted(vk_buffer & dst, size_t offset, const void * src, size_t spitch, size_t dpitch, size_t width, size_t height) {
+    static const bool enabled = [] { const char * e = getenv("LOCAL_VK_POSTED_WRITES"); return e == nullptr || atoi(e) != 0; }();
+    vk_device & device = dst->device;
+    if (!enabled || !device->compute_queue || width * height > 16384 || width % 4 != 0 || offset % 4 != 0 || dpitch % 4 != 0 || width == 0) {
+        return false;
+    }
+    std::lock_guard<std::recursive_mutex> guard(device->mutex);
+    if (!device->local_posted_pool) {
+        device->local_posted_pool = device->device.createCommandPool({ vk::CommandPoolCreateFlagBits::eResetCommandBuffer, device->compute_queue->queue_family_index });
+        auto cmds = device->device.allocateCommandBuffers({ device->local_posted_pool, vk::CommandBufferLevel::ePrimary, (uint32_t) vk_device_struct::local_posted_ring });
+        for (int i = 0; i < vk_device_struct::local_posted_ring; i++) {
+            device->local_posted_cmd[i]   = cmds[i];
+            device->local_posted_fence[i] = device->device.createFence({});
+        }
+    }
+    const int k = device->local_posted_next;
+    device->local_posted_next = (k + 1) % vk_device_struct::local_posted_ring;
+    if (device->local_posted_busy[k]) {
+        VK_CHECK(device->device.waitForFences({ device->local_posted_fence[k] }, true, UINT64_MAX), "posted write waitForFences", device);
+        device->device.resetFences({ device->local_posted_fence[k] });
+        device->local_posted_busy[k] = false;
+    }
+    vk::CommandBuffer cmd = device->local_posted_cmd[k];
+    cmd.reset();
+    cmd.begin({ vk::CommandBufferUsageFlagBits::eOneTimeSubmit });
+    // earlier work on the queue may still read dst
+    const vk::MemoryBarrier before{ vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite,
+                                    vk::AccessFlagBits::eTransferWrite };
+    cmd.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eTransfer, {}, { before }, {}, {});
+    for (size_t i = 0; i < height; i++) {
+        cmd.updateBuffer(dst->buffer, offset + i * dpitch, width, (const uint8_t *) src + i * spitch);
+    }
+    const vk::MemoryBarrier after{ vk::AccessFlagBits::eTransferWrite,
+                                   vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite };
+    cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eAllCommands, {}, { after }, {}, {});
+    cmd.end();
+    vk::SubmitInfo si(0, nullptr, nullptr, 1, &cmd);
+    device->compute_queue->handle->submit({ si }, device->local_posted_fence[k]);
+    device->local_posted_busy[k] = true;
+    return true;
+}
+
 void ggml_vk_buffer_write_2d(vk_buffer& dst, size_t offset, const void * src, size_t spitch, size_t dpitch, size_t width, size_t height) {
     VK_LOG_DEBUG("ggml_vk_buffer_write_2d(" << width << ", " << height << ")");
     // Buffer is already mapped
@@ -614,6 +672,8 @@ void ggml_vk_buffer_write_2d(vk_buffer& dst, size_t offset, const void * src, si
                 memcpy((uint8_t *)dst->ptr + offset + i * dpitch, (const uint8_t *) src + i * spitch, width);
             }
         }
+    } else if (ggml_vk_local_buffer_write_posted(dst, offset, src, spitch, dpitch, width, height)) {
+        return;
     } else {
         std::lock_guard<std::recursive_mutex> guard(dst->device->mutex);
 

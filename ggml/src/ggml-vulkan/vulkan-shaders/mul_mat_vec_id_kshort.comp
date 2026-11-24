@@ -1,0 +1,179 @@
+#version 450
+
+// local: MUL_MAT_ID mat-vec for Q4_K / Q6_K experts with short rows (a few 256-blocks, e.g. k=256
+// in a 3-way tensor split of a 768-wide expert). The stock kernel spends a 16-lane group on one block
+// and a full-subgroup reduction per row, so with one block per row most lanes idle.
+// Here a cluster of 8 lanes owns a row: lane j handles sub-block j (32 weights, one scale) of every
+// block, the 8 partial sums meet in a clustered add, and each cluster walks NUM_ROWS/8 rows.
+// Workgroup = one subgroup of 64.
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+#include "mul_mat_vec_base.glsl"
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+#define CLUSTER 8
+#define MAX_RPC 8
+
+#if defined(DATA_A_Q4_K)
+// one sub-block of 32 weights: sum_i q_i * y_i scaled by d*sc, minus dmin*m*sum_i y_i
+FLOAT_TYPE sub_dot(const uint ib, const uint j, const vec4 y[8], const FLOAT_TYPE ysum) {
+    const vec2 dm = vec2(data_a[ib].dm);
+    // 6-bit scale and min of sub-block j (get_scale_min_k)
+    uint sc, mn;
+    if (j < 4) {
+        sc = uint(data_a[ib].scales[j]) & 63;
+        mn = uint(data_a[ib].scales[j + 4]) & 63;
+    } else {
+        const uint s4 = uint(data_a[ib].scales[j + 4]);
+        sc = (s4 & 0xF) | ((uint(data_a[ib].scales[j - 4]) >> 6) << 4);
+        mn = (s4 >> 4)  | ((uint(data_a[ib].scales[j])     >> 6) << 4);
+    }
+    const uint qbase = (j >> 1) * 8;      // uint32 index of the 32 bytes holding this sub-block
+    const uint shift = (j & 1) * 4;
+    FLOAT_TYPE acc = FLOAT_TYPE(0);
+    [[unroll]] for (uint w = 0; w < 8; w++) {
+        const uint q = (data_a_packed32[ib].qs[qbase + w] >> shift) & 0x0F0F0F0F;
+        const vec4 qf = vec4(unpack8(q));
+        acc = fma(qf.x, y[w].x, fma(qf.y, y[w].y, fma(qf.z, y[w].z, fma(qf.w, y[w].w, acc))));
+    }
+    return fma(dm.x * FLOAT_TYPE(sc), acc, -dm.y * FLOAT_TYPE(mn) * ysum);
+}
+#elif defined(DATA_A_Q6_K)
+// lane j: half h = j/4, line g = j%4 of dequantize_row_q6_K; weights y[h*128 + g*32 + l]
+FLOAT_TYPE sub_dot(const uint ib, const uint j, const vec4 y[8], const FLOAT_TYPE ysum) {
+    const uint h = j >> 2;
+    const uint g = j & 3;
+    const uint ql16 = (h * 64 + (g & 1) * 32) / 2;  // uint16 index
+    const uint qh16 = (h * 32) / 2;
+    const uint lshift = (g >> 1) * 4;
+    const uint hshift = g * 2;
+    const FLOAT_TYPE d = FLOAT_TYPE(data_a[ib].d);
+    FLOAT_TYPE acc0 = FLOAT_TYPE(0);  // l <  16, scale is+0
+    FLOAT_TYPE acc1 = FLOAT_TYPE(0);  // l >= 16, scale is+1
+    [[unroll]] for (uint w = 0; w < 8; w++) {
+        const uint ql = uint(data_a_packed16[ib].ql[ql16 + 2*w]) | (uint(data_a_packed16[ib].ql[ql16 + 2*w + 1]) << 16);
+        const uint qh = uint(data_a_packed16[ib].qh[qh16 + 2*w]) | (uint(data_a_packed16[ib].qh[qh16 + 2*w + 1]) << 16);
+        const uint q = ((ql >> lshift) & 0x0F0F0F0F) | (((qh >> hshift) & 0x03030303) << 4);
+        const vec4 qf = vec4(unpack8(q)) - 32.0;
+        const FLOAT_TYPE s = fma(qf.x, y[w].x, fma(qf.y, y[w].y, fma(qf.z, y[w].z, qf.w * y[w].w)));
+        if (w < 4) {
+            acc0 += s;
+        } else {
+            acc1 += s;
+        }
+    }
+    const uint sidx = h * 8 + g * 2;
+    return d * fma(FLOAT_TYPE(data_a[ib].scales[sidx]), acc0, FLOAT_TYPE(data_a[ib].scales[sidx + 1]) * acc1);
+}
+#endif
+
+void main() {
+    uint a_offset, b_offset, d_offset;
+    get_offsets(a_offset, b_offset, d_offset);
+
+    const uint tid  = gl_LocalInvocationID.x;
+    const uint j    = tid % CLUSTER;  // sub-block
+    const uint c    = tid / CLUSTER;  // cluster
+    const uint nclu = gl_WorkGroupSize.x / CLUSTER;
+    const uint rpc  = NUM_ROWS / nclu; // rows per cluster
+
+    const uint first_row = NUM_ROWS * (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z);
+    const uint nb = p.ncols / QUANT_K;
+
+    // SUM_EXPERTS (one token, own pipeline with few rows): cluster c takes expert slots c, c + 8, ... for all
+    // NUM_ROWS rows of the workgroup, and a full-subgroup add per row sums sub-blocks and experts together, so
+    // the multiply by the routing weights and the ADD chain over the slots are fused into this dispatch
+    if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SUM_EXPERTS) != 0) {
+        FLOAT_TYPE sacc[MAX_RPC];
+        [[unroll]] for (uint t = 0; t < MAX_RPC; t++) {
+            sacc[t] = FLOAT_TYPE(0);
+        }
+        for (uint e = c; e < p.nei0; e += nclu) {
+            const int ex = data_ids[e + p.expert_i1 * p.nbi1];
+            const uint ao = uint(max(ex, 0)) * (p.batch_stride_a / QUANT_K);
+            const uint bo = (e % p.ne11) * p.stride_b + p.expert_i1 * p.batch_stride_b;
+            const FLOAT_TYPE w = ex < 0 ? FLOAT_TYPE(0) : FLOAT_TYPE(data_fuse0[e]);
+            for (uint blk = 0; blk < nb; blk++) {
+                vec4 y[8];
+                const uint yb = (bo + blk * QUANT_K + j * 32) / 4;
+                FLOAT_TYPE ysum = FLOAT_TYPE(0);
+                [[unroll]] for (uint wq = 0; wq < 8; wq++) {
+                    y[wq] = vec4(data_b_v4[yb + wq]);
+                    ysum += y[wq].x + y[wq].y + y[wq].z + y[wq].w;
+                }
+                [[unroll]] for (uint t = 0; t < MAX_RPC; t++) {
+                    const uint row = first_row + t;
+                    if (t < NUM_ROWS && row < p.stride_d) {
+                        sacc[t] += w * sub_dot(ao + row * nb + blk, j, y, ysum);
+                    }
+                }
+            }
+        }
+        [[unroll]] for (uint t = 0; t < MAX_RPC; t++) {
+            if (t < NUM_ROWS) {
+                const FLOAT_TYPE r = subgroupAdd(sacc[t]);
+                const uint row = first_row + t;
+                if (tid == t && row < p.stride_d) {
+                    data_d[d_offset + row] = D_TYPE(r);
+                }
+            }
+        }
+        return;
+    }
+
+    FLOAT_TYPE acc[MAX_RPC];
+    [[unroll]] for (uint t = 0; t < MAX_RPC; t++) {
+        acc[t] = FLOAT_TYPE(0);
+    }
+
+    {
+        const uint ao = a_offset;
+        const uint bo = b_offset;
+        const FLOAT_TYPE w = FLOAT_TYPE(1);
+        for (uint blk = 0; blk < nb; blk++) {
+            // this lane's 32 activations, shared by all rows of the expert
+            vec4 y[8];
+            const uint yb = (bo + blk * QUANT_K + j * 32) / 4;
+            FLOAT_TYPE ysum = FLOAT_TYPE(0);
+            [[unroll]] for (uint wq = 0; wq < 8; wq++) {
+                y[wq] = vec4(data_b_v4[yb + wq]);
+                ysum += y[wq].x + y[wq].y + y[wq].z + y[wq].w;
+            }
+            [[unroll]] for (uint t = 0; t < MAX_RPC; t++) {
+                if (t < rpc) {
+                    const uint row = first_row + c + t * nclu;
+                    if (row < p.stride_d) {
+                        acc[t] += w * sub_dot(ao + row * nb + blk, j, y, ysum);
+                    }
+                }
+            }
+        }
+    }
+
+    [[unroll]] for (uint t = 0; t < MAX_RPC; t++) {
+        if (t < rpc) {
+            const uint row = first_row + c + t * nclu;
+            FLOAT_TYPE r = subgroupClusteredAdd(acc[t], CLUSTER);
+            if (j == 0 && row < p.stride_d) {
+                if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS0) != 0) {
+                    r += FLOAT_TYPE(data_fuse0[expert_id*p.stride_d + row]);
+                }
+                if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE0) != 0) {
+                    r *= FLOAT_TYPE(data_fuse0[gl_GlobalInvocationID.y]);
+                }
+                if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE1) != 0) {
+                    r *= FLOAT_TYPE(data_fuse1[gl_GlobalInvocationID.y]);
+                }
+                if (expert_skip) {
+                    r = FLOAT_TYPE(0);
+                }
+                data_d[d_offset + row] = D_TYPE(r);
+            }
+        }
+    }
+}

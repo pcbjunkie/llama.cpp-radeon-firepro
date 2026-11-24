@@ -26,6 +26,17 @@
 #include "fit.h"
 #include "ggml.h"
 #include "llama.h"
+
+#include <dlfcn.h>
+// local: profile only the measured section of each run
+static void local_profile_range(bool on) {
+    setenv("LOCAL_PROFILE_ACTIVE", on ? "1" : "0", 1);
+    typedef int (*fn_t)(void);
+    static fn_t start = (fn_t) dlsym(RTLD_DEFAULT, "cudaProfilerStart");
+    static fn_t stop  = (fn_t) dlsym(RTLD_DEFAULT, "cudaProfilerStop");
+    if (on && start) { start(); }
+    if (!on && stop) { stop(); }
+}
 #include "log.h"
 
 #ifdef _WIN32
@@ -2500,6 +2511,7 @@ int llama_bench(int argc, char ** argv) {
                 }
             }
 
+            local_profile_range(true);
             uint64_t t_start = get_time_ns();
 
             if (t.n_prompt > 0) {
@@ -2530,6 +2542,7 @@ int llama_bench(int argc, char ** argv) {
             }
 
             uint64_t t_ns = get_time_ns() - t_start;
+            local_profile_range(false);
             t.samples_ns.push_back(t_ns);
         }
 

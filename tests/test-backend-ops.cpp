@@ -13845,6 +13845,39 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
+    // local: Qwen3-30B-A3B decode attention per device (1 kv head, 8 q heads) and layer split (4 kv heads)
+    for (int64_t kv : { 256, 1024, 4096, 16384 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, {8, 1}, kv, 1, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {8, 1}, kv, 1, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    }
+    // local: same, prompt processing (512-token batch)
+    for (int64_t kv : { 4096, 16384 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, {8, 1}, kv, 512, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {8, 1}, kv, 512, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    }
+    // local: Qwen3-30B-A3B decode shapes, tensor split 4 ways (k=256 down) and layer split (k=768)
+    for (ggml_type t : { GGML_TYPE_Q4_K, GGML_TYPE_Q6_K }) {
+        test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 128, 8, false, 2048, 1, 256));
+        test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 128, 8, false, 2048, 1, 768));
+        test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 128, 8, false, 256, 1, 2048));
+        test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 2048, 1, 1024, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 2048, 1, 4096, {1, 1}, {1, 1}));
+    }
+    // local: Qwen3-30B-A3B router top-k (128 experts, 8 used, softmax then norm), one token
+    test_cases.emplace_back(new test_topk_moe({128, 1, 1, 1}, 8, true, false, GATING_FUNC_SOFTMAX, 0.0f));
+    // local: every decode matmul of a tensor split device (q/k/v/o, router, experts)
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 1024, 1, 2048, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,  128, 1, 2048, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32,  128, 1, 2048, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32,  GGML_TYPE_F32,  128, 1, 2048, {1, 1}, {1, 1}));
+    // local: same, prompt processing (512-token batch), tensor split per device
+    for (ggml_type t : { GGML_TYPE_Q4_K, GGML_TYPE_Q6_K }) {
+        test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 128, 8, false, 256, 512, 2048));
+        test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 128, 8, false, 2048, 512, 256));
+        test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 1024, 512, 2048, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 2048, 512, 1024, {1, 1}, {1, 1}));
+    }
+
     test_cases.emplace_back(new test_timestep_embedding());
     test_cases.emplace_back(new test_timestep_embedding(GGML_TYPE_F32, {32769, 1, 1, 1}, 4096, 10000));
     test_cases.emplace_back(new test_timestep_embedding(GGML_TYPE_F32, {65, 1, 1, 1}, 1, 10000));

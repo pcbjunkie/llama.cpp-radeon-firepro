@@ -14,6 +14,11 @@
 #include <map>
 #include <memory>
 #include <set>
+#include <mutex>
+#include <condition_variable>
+#include <atomic>
+#include <thread>
+#include <chrono>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -1899,6 +1904,121 @@ struct ggml_backend_meta_context {
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
 
+    // local: one host thread per device, each records its own subgraphs and reductions
+    typedef uint64_t (*comm_begin_t)(void * comm_ctx, size_t max_nbytes, size_t n_rounds);
+    typedef bool     (*comm_allreduce_dev_t)(void * comm_ctx, size_t i, ggml_tensor * t, uint64_t round);
+    comm_begin_t                 comm_begin         = nullptr;
+    comm_allreduce_dev_t         comm_allreduce_dev = nullptr;
+    std::vector<std::thread>     workers;
+    std::mutex                   job_mutex;
+    std::condition_variable      job_cv;
+    std::atomic<uint64_t>        job_gen{ 0 };
+    std::atomic<size_t>          job_left{ 0 };
+    std::atomic<bool>            job_stop{ false };
+    uint64_t                     job_round = 0;
+    std::vector<ggml_status>     job_status;
+
+    void worker_main(size_t j) {
+        uint64_t seen = 0;
+        for (;;) {
+            // spin briefly, decode graphs arrive back to back
+            for (int spin = 0; job_gen.load(std::memory_order_acquire) == seen && spin < 20000 && !job_stop.load(); spin++) {
+                std::this_thread::yield();
+            }
+            if (job_gen.load(std::memory_order_acquire) == seen) {
+                std::unique_lock<std::mutex> lock(job_mutex);
+                job_cv.wait(lock, [&] { return job_gen.load() != seen || job_stop.load(); });
+            }
+            if (job_stop.load()) {
+                return;
+            }
+            seen = job_gen.load(std::memory_order_acquire);
+            static const bool local_log = getenv("LOCAL_META_LOG") != nullptr;
+            const auto t0 = std::chrono::steady_clock::now();
+            job_status[j] = run_device(j, job_round);
+            if (local_log) {
+                const auto t1 = std::chrono::steady_clock::now();
+                fprintf(stderr, "METAJOB dev=%zu start=%lld us=%lld\n", j,
+                    (long long) std::chrono::duration_cast<std::chrono::microseconds>(t0.time_since_epoch()).count(),
+                    (long long) std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count());
+            }
+            if (job_left.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                std::lock_guard<std::mutex> lock(job_mutex);
+                job_cv.notify_all();
+            }
+        }
+    }
+
+    ggml_status run_device(size_t j, uint64_t round) {
+        auto & bcj = backend_configs[j];
+        for (size_t i = 0; i < n_subgraphs; i++) {
+            const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
+            if (status != GGML_STATUS_SUCCESS) {
+                return status;
+            }
+            if (i < n_subgraphs - 1) {
+                ggml_cgraph * cg = bcj.cgraphs[i].cgraph_main;
+                if (!comm_allreduce_dev(comm_ctx, j, cg->nodes[cg->n_nodes - 1], round + i)) {
+                    return GGML_STATUS_FAILED;
+                }
+            }
+        }
+        return GGML_STATUS_SUCCESS;
+    }
+
+    // true if handled by the worker threads
+    bool try_run_threaded(ggml_backend_meta_context * self, ggml_status & status) {
+        static const bool disabled = getenv("LOCAL_META_SERIAL") != nullptr;
+        const size_t n = backend_configs.size();
+        if (disabled || !comm_begin || !comm_allreduce_dev || n < 2 || n_subgraphs < 2) {
+            return false;
+        }
+        size_t max_nbytes = 0;
+        for (size_t i = 0; i + 1 < n_subgraphs; i++) {
+            const ggml_tensor * t0 = nullptr;
+            for (size_t j = 0; j < n; j++) {
+                ggml_cgraph * cg = backend_configs[j].cgraphs[i].cgraph_main;
+                const ggml_tensor * t = cg->nodes[cg->n_nodes - 1];
+                if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) || !t->buffer || (t0 && ggml_nelements(t) != ggml_nelements(t0))) {
+                    return false;
+                }
+                t0 = t;
+            }
+            max_nbytes = std::max(max_nbytes, ggml_nbytes(t0));
+        }
+        const uint64_t round = comm_begin(comm_ctx, max_nbytes, n_subgraphs - 1);
+        if (round == 0) {
+            return false;
+        }
+        if (workers.empty()) {
+            job_status.assign(n, GGML_STATUS_SUCCESS);
+            for (size_t j = 0; j < n; j++) {
+                workers.emplace_back([self, j] { self->worker_main(j); });
+            }
+        }
+        job_round = round;
+        job_left.store(n, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lock(job_mutex);
+            job_gen.fetch_add(1, std::memory_order_acq_rel);
+        }
+        job_cv.notify_all();
+        for (int spin = 0; job_left.load(std::memory_order_acquire) != 0 && spin < 200000; spin++) {
+            std::this_thread::yield();
+        }
+        if (job_left.load(std::memory_order_acquire) != 0) {
+            std::unique_lock<std::mutex> lock(job_mutex);
+            job_cv.wait(lock, [&] { return job_left.load() == 0; });
+        }
+        status = GGML_STATUS_SUCCESS;
+        for (ggml_status s : job_status) {
+            if (s != GGML_STATUS_SUCCESS) {
+                status = s;
+            }
+        }
+        return true;
+    }
+
     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
         const size_t n_devs = ggml_backend_meta_dev_n_devs(meta_dev);
         n_reduce_steps = std::ceil(std::log2(n_devs));
@@ -1929,10 +2049,21 @@ struct ggml_backend_meta_context {
                 ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(
                     ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_allreduce_tensor");
             GGML_ASSERT(comm_allreduce != nullptr);
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(simple_backends[0]));
+            comm_begin         = (comm_begin_t)         ggml_backend_reg_get_proc_address(reg, "local_backend_comm_begin");
+            comm_allreduce_dev = (comm_allreduce_dev_t) ggml_backend_reg_get_proc_address(reg, "local_backend_comm_allreduce_dev");
         }
     }
 
     ~ggml_backend_meta_context() {
+        {
+            std::lock_guard<std::mutex> lock(job_mutex);
+            job_stop.store(true);
+        }
+        job_cv.notify_all();
+        for (std::thread & w : workers) {
+            w.join();
+        }
         if (comm_ctx != nullptr) {
             ggml_backend_comm_free_t comm_free = (ggml_backend_comm_free_t) ggml_backend_reg_get_proc_address(
                 ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_configs[0].backend)), "ggml_backend_comm_free");
@@ -2534,6 +2665,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         return GGML_STATUS_SUCCESS;
     };
 
+
+    {
+        ggml_status status;
+        if (backend_ctx->try_run_threaded(backend_ctx, status)) {
+            return status;
+        }
+    }
 
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
         for (size_t j = 0; j < n_backends; j++) {

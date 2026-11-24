@@ -1,0 +1,240 @@
+#version 450
+
+// local: multi-token flash attention for GQA, head size 128, f16 K/V, f16 mask (one row per token).
+// The stock scalar path gives each workgroup a few rows of ONE query head, so every K/V row is read once per
+// (row block, query head): with 8 query heads per kv head that is 8x the K/V traffic, and on GCN3 the kernel
+// waits on those loads. Here a workgroup takes TW tokens x all G query heads of one kv head and reads each
+// 64-key chunk once. Wave w owns HR query heads of one token (G / HR waves per token).
+// Scores: the chunk's K rows are staged in shared memory (swizzled as in local_fa_decode4.comp), lane t owns
+// key t, Q comes from uniform (scalar) loads and the mask value of the lane's key is shared by the wave's heads.
+// P*V: lane t = (key group qv = t / 16, dims 8 gv .. 8 gv + 7) takes keys qv, qv + 4, ... with 16-byte V
+// loads (the waves of a workgroup read the same rows, so all but one hit L1).
+// A chunk whose keys are all masked for the wave's token is skipped (causal prompt: about half of them).
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_vote : require
+#extension GL_EXT_control_flow_attributes : enable
+
+#ifndef HR
+#define HR 4                // query heads per wave
+#endif
+#ifndef NW
+#define NW 8                // waves per workgroup
+#endif
+#ifndef VB
+#define VB 4               // V rows (per lane) loaded at a time, of 16 per chunk
+#endif
+#ifndef KPL
+#define KPL 2               // keys per lane: each Q read from shared memory feeds KPL keys
+#endif
+#define CK (64 * KPL)       // keys per chunk
+#define NT (64 * NW)
+#define KR (CK * 16 / NT)   // K units staged per thread
+
+layout(local_size_x = NT, local_size_y = 1, local_size_z = 1) in;
+
+layout (push_constant) uniform parameter {
+    uint N;        // tokens
+    uint KV;
+    uint G;        // query heads per kv head, multiple of HR, G / HR divides NW
+    uint q_s1;     // floats between tokens
+    uint q_s2;     // floats between query heads
+    uint k_s1;     // f16 elements between keys
+    uint k_s2;     // f16 elements between kv heads
+    uint v_s1;
+    uint v_s2;
+    uint m_s1;     // f16 elements between mask rows (tokens)
+    uint d_s1;     // floats between output heads
+    uint d_s2;     // floats between output tokens
+    float scale;
+} p;
+
+layout (binding = 0) readonly buffer Q { float q[]; };
+layout (binding = 1) readonly buffer K { uvec4 k4[]; };
+layout (binding = 2) readonly buffer V { uvec4 v4[]; };
+layout (binding = 3) readonly buffer M { uint m1[]; };
+layout (binding = 4) writeonly buffer D { float d[]; };
+
+#define HS 128
+
+shared uvec4 ks[CK * 16];
+shared vec4 ps[NW][CK];     // probabilities of key j for the wave's heads (HR <= 4)
+// the workgroup's query rows, row w * HR + h = head h of wave w, dims 4i..4i+3 at row * 32 + i. Scalar loads of Q
+// in the score loop re-read 2 KB per wave and chunk through the scalar cache (16 KB, shared by several CUs),
+// which thrashes, and each miss waits in the loop
+shared vec4 qs[NW * HR * 32];
+
+const float NEG_INF = -1.0 / 0.0;
+
+float mask_at(const uint tk, const uint key) {
+    const uint e = tk * p.m_s1 + min(key, p.KV - 1);
+    const vec2 mm = unpackHalf2x16(m1[e / 2]);
+    return (e & 1) != 0 ? mm.y : mm.x;
+}
+
+void load_k(const uint kb, const uint hk, const uint tid, const uint tk, const uint t, out uvec4 kr[KR], out float mk[KPL]) {
+    [[unroll]] for (uint c = 0; c < KPL; c++) {
+        mk[c] = mask_at(tk, kb + t + 64 * c);
+    }
+    [[unroll]] for (uint i = 0; i < KR; i++) {
+        const uint idx = tid + NT * i;
+        const uint key = min(kb + idx / 16, p.KV - 1);
+        kr[i] = k4[(key * p.k_s1 + hk * p.k_s2) / 8 + idx % 16];
+    }
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint w   = gl_SubgroupID;
+    const uint t   = gl_SubgroupInvocationID;
+    const uint hk  = gl_WorkGroupID.y;
+    const uint G   = p.G;
+    const uint wpt = G / HR;                         // waves per token
+    const uint TW  = NW / wpt;                       // tokens per workgroup
+    const uint tk0 = gl_WorkGroupID.x * TW + w / wpt;
+    const bool has_tok = tk0 < p.N;
+    const uint tk  = min(tk0, p.N - 1);
+    const uint h0  = (w % wpt) * HR;                 // first query head (within the kv head)
+
+    const uint gv = t % 16;
+    const uint qv = t / 16;
+    float Mh[HR];
+    float Lh[HR];
+    vec4  Oa[HR];
+    vec4  Ob[HR];
+    [[unroll]] for (uint h = 0; h < HR; h++) {
+        Mh[h] = NEG_INF;
+        Lh[h] = 0.0;
+        Oa[h] = vec4(0.0);
+        Ob[h] = vec4(0.0);
+    }
+
+    [[unroll]] for (uint i = 0; i < (NW * HR * 32) / NT; i++) {
+        const uint u = tid + NT * i;
+        const uint r = u / 32;
+        const uint wr = r / HR;
+        const uint tq = min(gl_WorkGroupID.x * TW + wr / wpt, p.N - 1);
+        const uint qb = tq * p.q_s1 + (hk * G + (wr % wpt) * HR + r % HR) * p.q_s2 + (u % 32) * 4;
+        qs[u] = vec4(q[qb], q[qb + 1], q[qb + 2], q[qb + 3]);
+    }
+    uvec4 kr[KR];
+    float mk[KPL];
+    load_k(0, hk, tid, tk, t, kr, mk);
+    const uint vbase = (hk * p.v_s2) / 8 + gv;
+    for (uint kb = 0; kb < p.KV; kb += CK) {
+        barrier();                          // previous chunk's K no longer read
+        [[unroll]] for (uint i = 0; i < KR; i++) {
+            const uint idx = tid + NT * i;
+            const uint j = idx / 16;
+            ks[j * 16 + ((idx % 16) ^ (j & 15))] = kr[i];
+        }
+        barrier();
+        float mv[KPL];
+        bool live = false;
+        [[unroll]] for (uint c = 0; c < KPL; c++) {
+            mv[c] = kb + t + 64 * c < p.KV ? mk[c] : NEG_INF;
+            live = live || mv[c] != NEG_INF;
+        }
+        if (kb + CK < p.KV) {
+            load_k(kb + CK, hk, tid, tk, t, kr, mk);   // in flight during this chunk
+        }
+        if (!has_tok || !subgroupAny(live)) {
+            continue;
+        }
+
+        float s[KPL][HR];
+        [[unroll]] for (uint c = 0; c < KPL; c++) {
+            [[unroll]] for (uint h = 0; h < HR; h++) {
+                s[c][h] = 0.0;
+            }
+        }
+        [[unroll]] for (uint d8 = 0; d8 < HS / 8; d8++) {
+            vec4 ka[KPL];
+            vec4 kc[KPL];
+            [[unroll]] for (uint c = 0; c < KPL; c++) {
+                const uint j = t + 64 * c;
+                const uvec4 kk = ks[j * 16 + (d8 ^ (j & 15))];
+                ka[c] = vec4(unpackHalf2x16(kk.x), unpackHalf2x16(kk.y));
+                kc[c] = vec4(unpackHalf2x16(kk.z), unpackHalf2x16(kk.w));
+            }
+            [[unroll]] for (uint h = 0; h < HR; h++) {
+                const uint qh = (w * HR + h) * 32 + d8 * 2;   // uniform address: LDS broadcast
+                const vec4 qa = qs[qh];
+                const vec4 qc = qs[qh + 1];
+                [[unroll]] for (uint c = 0; c < KPL; c++) {
+                    s[c][h] += dot(qa, ka[c]) + dot(qc, kc[c]);
+                }
+            }
+        }
+
+        float pe[KPL][HR];
+        [[unroll]] for (uint h = 0; h < HR; h++) {
+            float sv[KPL];
+            float ml = NEG_INF;
+            [[unroll]] for (uint c = 0; c < KPL; c++) {
+                sv[c] = mv[c] == NEG_INF ? NEG_INF : s[c][h] * p.scale + mv[c];
+                ml = max(ml, sv[c]);
+            }
+            const float mx = subgroupMax(ml);
+            const float mn = max(Mh[h], mx);
+            const float corr = Mh[h] == NEG_INF ? 0.0 : exp(Mh[h] - mn);
+            float ls = 0.0;
+            [[unroll]] for (uint c = 0; c < KPL; c++) {
+                pe[c][h] = sv[c] == NEG_INF ? 0.0 : exp(sv[c] - mn);
+                ls += pe[c][h];
+            }
+            Lh[h] = Lh[h] * corr + subgroupAdd(ls);
+            Oa[h] *= corr;
+            Ob[h] *= corr;
+            Mh[h] = mn;
+        }
+        [[unroll]] for (uint c = 0; c < KPL; c++) {
+            vec4 pv = vec4(0.0);
+            [[unroll]] for (uint h = 0; h < HR; h++) {
+                pv[h] = pe[c][h];
+            }
+            ps[w][t + 64 * c] = pv;
+        }
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();
+
+        // keys past KV have p = 0 (clamped index)
+        [[unroll]] for (uint i0 = 0; i0 < CK / 4; i0 += VB) {
+            uvec4 vr[VB];
+            [[unroll]] for (uint i = 0; i < VB; i++) {
+                const uint kj = min(kb + 4 * (i0 + i) + qv, p.KV - 1);
+                vr[i] = v4[(kj * p.v_s1) / 8 + vbase];
+            }
+            [[unroll]] for (uint i = 0; i < VB; i++) {
+                const vec4 pj = ps[w][4 * (i0 + i) + qv];
+                const vec4 va = vec4(unpackHalf2x16(vr[i].x), unpackHalf2x16(vr[i].y));
+                const vec4 vb = vec4(unpackHalf2x16(vr[i].z), unpackHalf2x16(vr[i].w));
+                [[unroll]] for (uint h = 0; h < HR; h++) {
+                    Oa[h] += pj[h] * va;
+                    Ob[h] += pj[h] * vb;
+                }
+            }
+        }
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();
+    }
+
+    [[unroll]] for (uint h = 0; h < HR; h++) {
+        Oa[h] += subgroupShuffleXor(Oa[h], 16);
+        Ob[h] += subgroupShuffleXor(Ob[h], 16);
+        Oa[h] += subgroupShuffleXor(Oa[h], 32);
+        Ob[h] += subgroupShuffleXor(Ob[h], 32);
+    }
+    if (has_tok && qv == 0) {
+        [[unroll]] for (uint h = 0; h < HR; h++) {
+            const float il = Lh[h] > 0.0 ? 1.0 / Lh[h] : 0.0;
+            const vec4 oa = Oa[h] * il;
+            const vec4 ob = Ob[h] * il;
+            const uint db = tk * p.d_s2 + (hk * G + h0 + h) * p.d_s1 + 8 * gv;
+            d[db]     = oa.x; d[db + 1] = oa.y; d[db + 2] = oa.z; d[db + 3] = oa.w;
+            d[db + 4] = ob.x; d[db + 5] = ob.y; d[db + 6] = ob.z; d[db + 7] = ob.w;
+        }
+    }
+}

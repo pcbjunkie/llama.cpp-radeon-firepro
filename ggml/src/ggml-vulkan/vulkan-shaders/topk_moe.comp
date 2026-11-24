@@ -172,6 +172,7 @@ void main() {
             }
         }
 
+#ifdef LOCAL_TOPK_XOR
         [[unroll]]
         for (uint mask = WARP_SIZE / 2; mask > 0; mask /= 2) {
             const float val    = subgroupShuffleXor(max_val, mask);
@@ -183,6 +184,17 @@ void main() {
                 max_expert = expert;
             }
         }
+#else
+        // local: same selection (highest, then lowest expert on ties) as two subgroup reductions, which lower to
+        // DPP rows; the shuffle butterfly above is a ds_bpermute round trip per value and step on GCN
+        {
+            const float best_s = subgroupMax(max_val_s);
+            const uint  best_e = subgroupMin(max_val_s == best_s ? max_expert : 0xFFFFFFFFu);
+            max_val    = has_bias != 0 ? subgroupShuffle(max_val, best_e & (WARP_SIZE - 1)) : best_s;
+            max_val_s  = best_s;
+            max_expert = best_e;
+        }
+#endif
 
         if ((k & (WARP_SIZE - 1)) == lane) {
             output_weights[k / WARP_SIZE] = max_val;
