@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="360" viewBox="0 0 720 360" font-family="system-ui, -apple-system, Segoe UI, Helvetica, Arial, sans-serif" role="img" aria-label="Token generation">
+<rect width="720" height="360" rx="8" fill="#1a1a19"/>
+<text x="20" y="30" font-size="17" font-weight="600" fill="#f0efec">Token generation</text>
+<text x="20" y="52" font-size="13" fill="#c3c2b7">tg128, tokens/s (higher is better)</text>
+<rect x="510" y="20" width="12" height="12" rx="3" fill="#3987e5"/>
+<text x="528" y="30" font-size="13" fill="#c3c2b7">S7150 x4</text>
+<rect x="608" y="20" width="12" height="12" rx="3" fill="#d95926"/>
+<text x="626" y="30" font-size="13" fill="#c3c2b7">P100 x2</text>
+<line x1="56" x2="700" y1="314.0" y2="314.0" stroke="#383835" stroke-width="1"/>
+<text x="48" y="318.0" font-size="11" text-anchor="end" fill="#898781">0</text>
+<line x1="56" x2="700" y1="280.3" y2="280.3" stroke="#2c2c2a" stroke-width="1"/>
+<text x="48" y="284.3" font-size="11" text-anchor="end" fill="#898781">10</text>
+<line x1="56" x2="700" y1="246.6" y2="246.6" stroke="#2c2c2a" stroke-width="1"/>
+<text x="48" y="250.6" font-size="11" text-anchor="end" fill="#898781">20</text>
+<line x1="56" x2="700" y1="212.9" y2="212.9" stroke="#2c2c2a" stroke-width="1"/>
+<text x="48" y="216.9" font-size="11" text-anchor="end" fill="#898781">30</text>
+<line x1="56" x2="700" y1="179.1" y2="179.1" stroke="#2c2c2a" stroke-width="1"/>
+<text x="48" y="183.1" font-size="11" text-anchor="end" fill="#898781">40</text>
+<line x1="56" x2="700" y1="145.4" y2="145.4" stroke="#2c2c2a" stroke-width="1"/>
+<text x="48" y="149.4" font-size="11" text-anchor="end" fill="#898781">50</text>
+<line x1="56" x2="700" y1="111.7" y2="111.7" stroke="#2c2c2a" stroke-width="1"/>
+<text x="48" y="115.7" font-size="11" text-anchor="end" fill="#898781">60</text>
+<line x1="56" x2="700" y1="78.0" y2="78.0" stroke="#2c2c2a" stroke-width="1"/>
+<text x="48" y="82.0" font-size="11" text-anchor="end" fill="#898781">70</text>
+<path d="M98.3,314.0 V147.1 Q98.3,143.1 102.3,143.1 H158.3 Q162.3,143.1 162.3,147.1 V314.0 Z" fill="#3987e5"/>
+<text x="130.3" y="136.1" font-size="12" text-anchor="middle" fill="#c3c2b7">50.7</text>
+<path d="M164.3,314.0 V101.6 Q164.3,97.6 168.3,97.6 H224.3 Q228.3,97.6 228.3,101.6 V314.0 Z" fill="#d95926"/>
+<text x="196.3" y="90.6" font-size="12" text-anchor="middle" fill="#c3c2b7">64.2</text>
+<text x="163.3" y="336" font-size="12" text-anchor="middle" fill="#c3c2b7">empty context</text>
+<path d="M313.0,314.0 V162.9 Q313.0,158.9 317.0,158.9 H373.0 Q377.0,158.9 377.0,162.9 V314.0 Z" fill="#3987e5"/>
+<text x="345.0" y="151.9" font-size="12" text-anchor="middle" fill="#c3c2b7">46.0</text>
+<path d="M379.0,314.0 V102.2 Q379.0,98.2 383.0,98.2 H439.0 Q443.0,98.2 443.0,102.2 V314.0 Z" fill="#d95926"/>
+<text x="411.0" y="91.2" font-size="12" text-anchor="middle" fill="#c3c2b7">64.0</text>
+<text x="378.0" y="336" font-size="12" text-anchor="middle" fill="#c3c2b7">4K context</text>
+<path d="M527.7,314.0 V184.5 Q527.7,180.5 531.7,180.5 H587.7 Q591.7,180.5 591.7,184.5 V314.0 Z" fill="#3987e5"/>
+<text x="559.7" y="173.5" font-size="12" text-anchor="middle" fill="#c3c2b7">39.6</text>
+<path d="M593.7,314.0 V122.1 Q593.7,118.1 597.7,118.1 H653.7 Q657.7,118.1 657.7,122.1 V314.0 Z" fill="#d95926"/>
+<text x="625.7" y="111.1" font-size="12" text-anchor="middle" fill="#c3c2b7">58.1</text>
+<text x="592.7" y="336" font-size="12" text-anchor="middle" fill="#c3c2b7">16K context</text>
+</svg>
